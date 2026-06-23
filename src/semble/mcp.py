@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Annotated
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from semble.cache import save_index_to_cache
+from semble.cache import get_validated_cache, save_index_to_cache
 from semble.index import SembleIndex
 from semble.index.dense import load_model
 from semble.types import ContentType
@@ -25,6 +26,7 @@ _REPO_DESCRIPTION = (
 )
 
 _CACHE_MAX_SIZE = 10  # Max number of cached indexes to keep in memory
+_MIN_REVALIDATE_FACTOR = 3  # Don't recheck staleness sooner than this many times the last build's duration
 
 
 async def _get_index(
@@ -169,6 +171,7 @@ class _IndexCache:
         self._model_ready = asyncio.Event()
         self._content = content
         self._tasks: OrderedDict[str, asyncio.Task[SembleIndex]] = OrderedDict()  # ordered for LRU eviction
+        self._revalidate_after: dict[str, float] = {}  # cache_key -> monotonic time, staleness check is gated until
 
     async def _await_model(self) -> str:
         """Block until the model is installed; re-raise the load error if it failed."""
@@ -196,22 +199,63 @@ class _IndexCache:
             logger.warning("Failed to save index cache for %r", cache_key, exc_info=True)
         return index
 
+    async def _build_and_track(self, source: str, ref: str | None, model_path: str, cache_key: str) -> SembleIndex:
+        """Build an index and, for local paths, record when its staleness cooldown ends.
+
+        The cooldown write happens after the await, i.e. back on the event loop thread,
+        regardless of which thread `_build_and_cache_index` itself ran on.
+        """
+        start = time.monotonic()
+        index = await asyncio.to_thread(self._build_and_cache_index, source, ref, model_path, cache_key)
+        if not is_git_url(source):
+            finished = time.monotonic()
+            self._revalidate_after[cache_key] = finished + (finished - start) * _MIN_REVALIDATE_FACTOR
+        return index
+
     def evict(self, source: str) -> None:
-        self._tasks.pop(self._compute_cache_key(source), None)
+        cache_key = self._compute_cache_key(source)
+        self._tasks.pop(cache_key, None)
+        self._revalidate_after.pop(cache_key, None)
+
+    async def _evict_if_stale(self, source: str, cache_key: str) -> None:
+        """Evict a cached local-path entry whose on-disk cache no longer matches its files.
+
+        Skipped while inside the cooldown window so repos that are slow to build aren't
+        rebuilt faster than they can be served.
+        """
+        cached = self._tasks.get(cache_key)
+        if (
+            cached is None
+            or is_git_url(source)
+            or not cached.done()
+            or cached.cancelled()
+            or cached.exception() is not None
+        ):
+            return
+        if time.monotonic() < self._revalidate_after.get(cache_key, 0.0):
+            return
+        validated = await asyncio.to_thread(get_validated_cache, cache_key, self._model_path, self._content)
+        # Only evict if this entry hasn't already been replaced by a concurrent caller.
+        if validated is None and self._tasks.get(cache_key) is cached:
+            self.evict(source)
 
     async def get(self, source: str, ref: str | None = None) -> SembleIndex:
-        """Return an index for the requested source, building and caching it on first access."""
+        """Return an index for the requested source, building and caching it on first access.
+
+        Local paths are revalidated against the on-disk cache on every call (subject to a
+        cooldown scaled by build time), so an entry is rebuilt once its files change.
+        """
         cache_key = self._compute_cache_key(source, ref)
+        await self._evict_if_stale(source, cache_key)
 
         if cache_key not in self._tasks:
             model_path = await self._await_model()
             # Re-check after the await: another caller may have populated the entry.
             if cache_key not in self._tasks:
                 if len(self._tasks) >= _CACHE_MAX_SIZE:
-                    self._tasks.popitem(last=False)
-                self._tasks[cache_key] = asyncio.create_task(
-                    asyncio.to_thread(self._build_and_cache_index, source, ref, model_path, cache_key)
-                )
+                    evicted_key, _ = self._tasks.popitem(last=False)
+                    self._revalidate_after.pop(evicted_key, None)
+                self._tasks[cache_key] = asyncio.create_task(self._build_and_track(source, ref, model_path, cache_key))
         self._tasks.move_to_end(cache_key)
         task = self._tasks[cache_key]
         try:

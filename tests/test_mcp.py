@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -135,6 +136,7 @@ async def test_index_cache_builds_and_caches(
     with (
         patch(f"semble.mcp.SembleIndex.{patch_target}", return_value=fake_index) as mock_build,
         patch("semble.mcp.save_index_to_cache") as mock_save,
+        patch("semble.mcp.get_validated_cache", return_value=Path("/fake/cache")),
     ):
         first = await cache.get(resolved_source)
         second = await cache.get(resolved_source)
@@ -142,6 +144,89 @@ async def test_index_cache_builds_and_caches(
     assert second is fake_index
     mock_build.assert_called_once()
     mock_save.assert_called_once_with(fake_index, cache._compute_cache_key(resolved_source))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("source", "patch_target", "expected_build_calls", "validate_called"),
+    [
+        ("local_tmp_path", "from_path", 2, True),
+        ("https://github.com/org/repo", "from_git", 1, False),
+    ],
+    ids=["local_path_rebuilds_when_stale", "git_url_skips_revalidation"],
+)
+async def test_index_cache_staleness_check_scope(
+    cache: _IndexCache,
+    tmp_path: Path,
+    source: str,
+    patch_target: str,
+    expected_build_calls: int,
+    validate_called: bool,
+) -> None:
+    """Local paths are revalidated (and rebuilt when stale) on every get(); git URLs never are."""
+    resolved_source = str(tmp_path) if source == "local_tmp_path" else source
+    with (
+        patch(f"semble.mcp.SembleIndex.{patch_target}", return_value=MagicMock()) as mock_build,
+        patch("semble.mcp.save_index_to_cache"),
+        patch("semble.mcp.get_validated_cache", return_value=None) as mock_validate,
+        # Disable the cooldown: real build duration (here, just thread-dispatch overhead) would
+        # otherwise sometimes exceed the gap between the two get() calls below, flaking the test.
+        patch("semble.mcp._MIN_REVALIDATE_FACTOR", 0),
+    ):
+        await cache.get(resolved_source)
+        await cache.get(resolved_source)
+    assert mock_build.call_count == expected_build_calls
+    assert mock_validate.called is validate_called
+
+
+@pytest.mark.anyio
+async def test_index_cache_skips_staleness_check_during_cooldown(cache: _IndexCache, tmp_path: Path) -> None:
+    """A slow-to-build local path is not revalidated again until its cooldown elapses."""
+    cache_key = str(tmp_path.resolve())
+    cache._tasks[cache_key] = asyncio.create_task(_succeed())
+    await asyncio.sleep(0)  # let the task finish
+    cache._revalidate_after[cache_key] = time.monotonic() + 30.0  # a build that took 10s, just finished
+    with patch("semble.mcp.get_validated_cache") as mock_validate:
+        await cache._evict_if_stale(str(tmp_path), cache_key)
+    mock_validate.assert_not_called()
+
+
+async def _succeed() -> MagicMock:
+    return MagicMock()
+
+
+@pytest.mark.anyio
+async def test_index_cache_skips_staleness_check_for_failed_task(cache: _IndexCache, tmp_path: Path) -> None:
+    """A cached entry that finished with an exception is not revalidated; it is left for the normal retry path."""
+
+    async def _raise() -> MagicMock:
+        raise RuntimeError("boom")
+
+    cache._tasks[str(tmp_path.resolve())] = asyncio.create_task(_raise())
+    await asyncio.sleep(0)  # let the task finish
+    with patch("semble.mcp.get_validated_cache") as mock_validate:
+        await cache._evict_if_stale(str(tmp_path), str(tmp_path.resolve()))
+    mock_validate.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_index_cache_does_not_evict_entry_replaced_during_validation(cache: _IndexCache, tmp_path: Path) -> None:
+    """If a concurrent caller already replaced a stale entry, _evict_if_stale must not evict the new one."""
+    cache_key = str(tmp_path.resolve())
+    cache._tasks[cache_key] = asyncio.create_task(_succeed())
+    await asyncio.sleep(0)
+    cache._revalidate_after[cache_key] = 0.0  # cooldown already elapsed
+
+    replacement_task = object()
+
+    def _replace_entry_then_report_stale(*args: object, **kwargs: object) -> None:
+        # Simulate a concurrent get() winning the race and installing a fresh task first.
+        cache._tasks[cache_key] = replacement_task  # type: ignore[assignment]
+        return None
+
+    with patch("semble.mcp.get_validated_cache", side_effect=_replace_entry_then_report_stale):
+        await cache._evict_if_stale(str(tmp_path), cache_key)
+    assert cache._tasks.get(cache_key) is replacement_task
 
 
 @pytest.mark.anyio
